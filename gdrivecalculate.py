@@ -10,25 +10,14 @@ from pydrive.drive import GoogleDrive
 
 # --- Configuration ---
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
-API_ID = 29001415
-API_HASH = '92152fd62ffbff12f057edc057f978f1'
-BOT_TOKEN = '7505846620:AAFvv-sFybGfFILS-dRC8l7ph_0rqIhDgRM'
+API_ID = 'YOUR_API_ID'
+API_HASH = 'YOUR_API_HASH'
+BOT_TOKEN = 'YOUR_BOT_TOKEN'
 MAX_QUEUE_SIZE = 5  # Maximum number of files in the queue
 STORAGE_THRESHOLD = 1024 * 1024 * 1024 * 10  # 10 GB storage threshold
 MAX_CONCURRENT_THREADS = 2  # Maximum number of concurrent threads
 CREDENTIALS_FILE = 'credentials.json'
 TOKEN_FILE = 'token.pickle'
-
-# --- Google Drive Authentication ---
-gauth = GoogleAuth()
-# Try to load saved credentials
-if os.path.exists(CREDENTIALS_FILE):
-    gauth.LoadCredentialsFile(CREDENTIALS_FILE)
-if gauth.credentials is None or gauth.access_token_expired:
-    # If credentials are not available or expired, prompt for authentication
-    gauth.LocalWebserverAuth()
-    gauth.SaveCredentialsFile(CREDENTIALS_FILE)
-drive = GoogleDrive(gauth)
 
 # --- Telegram Client ---
 client = TelegramClient('your_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
@@ -39,6 +28,7 @@ processing_files = {}  # Dictionary to store file IDs and their processing statu
 file_queue = deque(maxlen=MAX_QUEUE_SIZE)  # Queue to store files waiting to be processed
 queue_condition = threading.Condition()  # Condition variable for queue synchronization
 active_threads = 0  # Number of currently active threads
+drive = None  # Initialize Google Drive client later
 
 # --- Helper Functions ---
 def check_disk_space(file_size):
@@ -48,7 +38,7 @@ def check_disk_space(file_size):
 
 def process_file(event):
     """Downloads and uploads the file."""
-    global active_threads
+    global active_threads, drive
     try:
         file_id = event.media.document.id
         processing_files[file_id] = True
@@ -58,6 +48,11 @@ def process_file(event):
 
         if not processing_files[file_id]:
             return
+
+        # Wait for credentials and initialize Google Drive client
+        with queue_condition:
+            while drive is None:
+                queue_condition.wait()
 
         client.loop.run_until_complete(event.respond("Uploading..."))
         gfile = drive.CreateFile({'title': event.file.name})
@@ -118,20 +113,33 @@ async def cancel_handler(event):
 @client.on(events.NewMessage(pattern='/credentials'))
 async def credentials_handler(event):
     """Handles /credentials command to upload credentials.json."""
-    async with client.action(event.chat_id, 'file'):
-        await event.reply_document(CREDENTIALS_FILE)
+    if os.path.exists(CREDENTIALS_FILE):
+        async with client.action(event.chat_id, 'file'):
+            await event.reply_document(CREDENTIALS_FILE)
+    else:
+        await event.reply("Credentials file not found.")
 
 @client.on(events.NewMessage(pattern='/token'))
 async def token_handler(event):
     """Handles /token command to upload token.pickle."""
-    async with client.action(event.chat_id, 'file'):
-        await event.reply_document(TOKEN_FILE)
+    if os.path.exists(TOKEN_FILE):
+        async with client.action(event.chat_id, 'file'):
+            await event.reply_document(TOKEN_FILE)
+    else:
+        await event.reply("Token file not found.")
 
 @client.on(events.NewMessage(incoming=True, func=lambda e: e.file and e.file.name == CREDENTIALS_FILE))
 async def update_credentials_handler(event):
     """Handles uploading a new credentials.json file."""
+    global drive
     await event.respond("Updating credentials...")
     await client.download_media(event.media, file=CREDENTIALS_FILE)
+    # Initialize Google Drive client after receiving credentials
+    gauth = GoogleAuth()
+    gauth.LoadCredentialsFile(CREDENTIALS_FILE)
+    drive = GoogleDrive(gauth)
+    with queue_condition:
+        queue_condition.notify_all()  # Notify all waiting threads
     await event.respond("Credentials updated successfully!")
 
 @client.on(events.NewMessage(incoming=True, func=lambda e: e.file and e.file.name == TOKEN_FILE))
